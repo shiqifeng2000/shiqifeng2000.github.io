@@ -1,6 +1,6 @@
 ---
 layout: post
-title: Implementing python oriented shared memory the rust way
+title: Some thoughts about shared memory
 subtitle: A raw_sync based shared memory
 gh-repo: shiqifeng2000/VideoEnhancer
 gh-badge: [star, fork, follow]
