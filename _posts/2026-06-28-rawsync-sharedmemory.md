@@ -4,7 +4,7 @@ title: Implementing python oriented shared memory the rust way
 subtitle: A raw_sync based shared memory
 gh-repo: shiqifeng2000/VideoEnhancer
 gh-badge: [star, fork, follow]
-tags: [test]
+tags: [rust, raw_sync]
 comments: true
 mathjax: true
 author: shiqifeng
@@ -106,6 +106,7 @@ So when i create a file using shared_memory, this shem crate shall map the file 
 When the work is done, and I review what I did. The atomic and pthread looks like duplicate functions.
 
 1. AtomicU8 Flag is a shared memory based flag, to enable python end to use it, I build a python wheel project in rust and installed a python sdk to help deal with the flag. Both end could use this flag, looks seems to more to be a **Process Safe** pattern. The intesting part is, if I use the flag as the mutex lock, it takes about 10ns for each loop, more than a quick responding `spin lock`
+
 ```rust
 while flag.load(Ordering::Relaxed) != CODE_CONSUMED {
     std::hint::spin_loop();
@@ -113,10 +114,10 @@ while flag.load(Ordering::Relaxed) != CODE_CONSUMED {
         bail!("Host timeout waiting for consumer flag CODE_CONSUMED")
     }
 }
-
 ```
 
 2. If I use mutex to synchonize the buffer, sys-call shall be introduced. In posix, it is `pthread-mutex`, or maybe `futex`. Since it is kernel involing work, the user/kernel context swapping is some costing.
+
 ```rust
 let lock = self.lock
   .try_lock(raw_sync::Timeout::Val(Duration::from_secs(timeout)))?;
