@@ -13,13 +13,16 @@ author: shiqifeng
 {: .box-success}
 A playback synchonizing design for mutiple videos on nvidia powered PCs.
 
-**Context: I will need to embed a `player` to unity to help decode 3+ videos and have them rendered and synchonized seamlessly against audios, each video is just one portion of a big screen, so each frame rendered must align exactly**
+![Crepe](../assets/img/2026-07-08/sddefault.jpg)
 
-In this post, I woud like to discuss a player design that render multiple videos(mp4). I knew in some system such as Mac, there's `AVVideoComposition` API or something alike. But my intention is not to just 'render' it, but got some cross-platform solution to share the surface to the actual renderer. So that the upper layer, a cross-platform player or application could just use the surface I produced. The video could be a 2k ~ 4k video with the framerate 30 ~ 60.
+**Context: I need to embed a player into Unity to decode 3+ videos, render them, and synchronize them seamlessly with audio. Each video represents one portion of a larger screen, so every rendered frame must align exactly.**
 
-### Firstly, how should we design the decoding workflow
 
-If we are to make sure all the videos are decoded smoothly, hw-accelerated decoding must be implemented, that means the frame we got from decoder sits in gpu memory, when rendering, we could use opengl or directx for displaying, so the displaying container should sits in gpu as well. Decoding and Rendering are of 2 different phrase, and got many different formats(say cuda produce nv12, while opengl/directx need rgb). Normally, people shall copy the gpu data from decoded frame, to cpu ram, then back again to rendering phrase - opengl surface/ directx shader or flinger buffer, whatsoever, Just because they need to change the format, or use some cpu bound only tool such as opencv, etc.
+In this post, I'd like to discuss a player design that renders multiple MP4 videos. I know that some systems, such as macOS, provide APIs like `AVVideoComposition`. However, my goal isn't just to "render" video — I need a cross-platform solution that can share the decoded surface with the actual renderer, so that an upper-layer cross-platform player or application can consume the surface I produce. The videos are 2K to 4K, running at 30 to 60 fps.
+
+### First, how should we design the decoding workflow?
+
+To ensure smooth decoding of all videos, hardware-accelerated decoding is a must. That means the frames we get from the decoder reside in GPU memory. For rendering, we can use OpenGL or DirectX for display, so the display container should also live on the GPU. Decoding and rendering are two distinct phases and often involve different formats — for example, CUDA produces NV12, while OpenGL/DirectX expects RGB. Typically, people copy the decoded GPU data to CPU RAM, convert the format, and copy it back to the rendering phase (OpenGL surface, DirectX shader, or framebuffer). This round-trip happens because they need to change the format or use CPU-bound tools like OpenCV.
 
 ```
                     Video Playback Pipeline
@@ -68,7 +71,7 @@ H264/H265/AV1   | (NVDEC / VideoToolbox /   |
                          Display Window
 ```
 
-But here's the math, a 4k video with 60fps means 3840x2160x1.5x60=712MB/s of data transfering, if there's 5 videos transfering at the same time, the speed shall be 5x712 = 3.5GB/s. If we are to copy gpu data to ram then ram to surface, it means 3.5GB/s of data from gpu to cpu, then 3.5GB/s of data from cpu to gpu for surface rendering. This approach will be rediculous, when the player stucks with normal PCIe bus copying speed or surface uploading restrictions.
+But let's do the math. A 4K video at 60 fps means 3840×2160×1.5×60 = 712 MB/s of data transfer. With 5 concurrent videos, that's 5 × 712 = 3.5 GB/s. If we copy from GPU to RAM, then from RAM back to the surface, we're talking about 3.5 GB/s in each direction. This approach becomes ridiculous when the player stalls due to PCIe bus bandwidth limits or surface upload constraints.
 
 ---
 **PCI Bus Copy Speeds**
@@ -83,7 +86,7 @@ But here's the math, a 4k video with 60fps means 3840x2160x1.5x60=712MB/s of dat
 | **PCIe 7.0** (expected 2025) | 128.0 GT/s | PAM4 | 32 GB/s | 128 GB/s | 256 GB/s | **512 GB/s** |
 
 
-**So I guess maybe the best way here is to copy decoded video data in gpu directly to surface**
+**So I think the best approach is to copy decoded video data directly from GPU to the surface, or Zero-Copy in other words**
 
 Something like:
 ```
@@ -110,14 +113,14 @@ Swapchain
     ▼
 Display
 ```
+This way, image processing stays entirely within the GPU. In the CUDA world, I need to introduce the [NPP](https://docs.nvidia.com/cuda/archive/9.1/npp/index.html) library for format conversion and other processing tasks. This is a must if we're targeting Unity3D, since the surface it provides is always in RGBA format.
 
-This way, the image processing must be within gpu realm, therefore in the story of cuda, I need to introduce the Cuda [NPP](https://docs.nvidia.com/cuda/archive/9.1/npp/index.html) lib to transform image format and other processing works. This job must be done if we are to play with Unity3D, since the surface they provided is always RGBA format.
+NPP doesn't support RGBA directly — only RGB. That's fine; we can convert with `nppiNV12ToRGB_8u_P2C3R_Ctx`, then use `cudaMemcpy2D` for pitching, and finally insert a 1 as the alpha value for every fourth item.
 
-NPP lib got no RGBA format, only RGB, but that's fine, let's do the converting with `nppiNV12ToRGB_8u_P2C3R_Ctx`, then pitching work with `cudaMemcpy2D`, inserting a 1 to every 4th item, as the alpha value.
+### Now that we have the surface data prepared, how do we fill it into the surface?
 
-### Now that we have the surface data prepared, how should we fill the data into surface?. 
+CUDA provides convenient APIs for interop. With `cudaGraphicsGLRegisterImage` or `cudaGraphicsD3D11RegisterImage`, we can register an OpenGL/D3D surface as a **CUDA resource**. Then, using `cudaGraphicsMapResources` and `cudaGraphicsSubResourceGetMappedArray`, we can obtain the resource buffer pointer or array, meaning the surface is ready to accept frame data.
 
-Cuda provide some convenient api, called cuda interopping. With `cudaGraphicsGLRegisterImage` or `cudaGraphicsD3D11RegisterImage`, we could get register a opengl/d3d surface as a **Cuda Resource**, then `cudaGraphicsMapResources`+`cudaGraphicsSubResourceGetMappedArray` , we could get the resource buffer pointer/ptr array, which means the surface is ready to accept frame copying.
 
 ```
 OpenGL / D3D Texture (Render Surface)
@@ -149,9 +152,9 @@ Compressed Stream
    Render / Present
 ```
 
-### Ok, now we get everything connected. But, just for one video scenario...
+### Okay, now everything is connected — but only for a single video.
 
-We could start multiple decoding thread, register multiple surface, then render them separately. Something like
+We can spin up multiple decoding threads, register multiple surfaces, and render them independently. Something like:
 
 ```
                  One-time Initialization
@@ -186,15 +189,16 @@ GL Texture1          GL Texture2          GL Texture3
   Present1             Present2             Present3
 ```
 
-Well, this design surely works. But we need to **synchonize** them. 
-A normal video player sychonizing got 3 pattern:
-1. video align to audio
-2. audio align to video
-3. both video/audio align to a unique timeline
+Well, This design certainly works — but we need **synchronization**.
 
-I picked up the 3rd option, since we got multiple video streams.Each video file got the same audio stream, so I pick up the first audio stream found from the video files, using a [cpal] (https://docs.rs/cpal/latest/cpal/) to play the sound, I will skip the audio details such as resampling thing since it is mainly about video works.
+A typical video player uses one of three synchronization strategies:
+1. Video aligns to audio
+2. Audio aligns to video
+3. Both video and audio align to a common timeline
 
-Before synchonizing, the picture should looks like 
+I chose the third option, since we have multiple video streams. Each video file contains the same audio stream, so I pick the first audio stream found and use [cpal](https://docs.rs/cpal/latest/cpal/) for playback. I'll skip the audio details (like resampling) since this post is primarily about video.
+
+Before synchronization, the picture looks like this:
 
 ```
                  One-time Initialization
