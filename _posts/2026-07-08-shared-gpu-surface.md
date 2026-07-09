@@ -73,7 +73,6 @@ H264/H265/AV1   | (NVDEC / VideoToolbox /   |
 
 But let's do the math. A 4K video at 60 fps means 3840×2160×4×60 = 1990 MB/s of RGBA data transfer. With 5 concurrent videos, that's 5 × 1990 = 9.9 GB/s. If we copy from GPU to RAM, then from RAM back to the surface, we're talking about 9.9 GB/s in each direction. This approach becomes ridiculous when the player stalls due to PCIe bus bandwidth limits or surface upload constraints.
 
----
 
 **PCI Bus Copy Speeds**
 
@@ -88,7 +87,7 @@ But let's do the math. A 4K video at 60 fps means 3840×2160×4×60 = 1990 MB/s 
 | **PCIe 6.0** | 64.0 GT/s | PAM4 + FEC | 7.56 GB/s | 30.25 GB/s | 60.5 GB/s | **121.0 GB/s** |
 | **PCIe 7.0** (expected 2025) | 128.0 GT/s | PAM4 | 32 GB/s | 128 GB/s | 256 GB/s | **512 GB/s** |
 
----
+
 
 
 **So I think the best approach is to copy decoded video data directly from GPU to the surface, or Zero-Copy in other words**
