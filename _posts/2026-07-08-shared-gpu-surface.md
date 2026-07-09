@@ -1,7 +1,7 @@
 ---
 layout: post
-title: Mutiple video decode+suface synchonizing design 
-subtitle: A cuda based heterogeneous playback design
+title: How to design a multiple video rendering lib with synchonizing feature.
+subtitle: A cuda based gpu interlop case with synchonization.
 gh-repo: shiqifeng2000/VideoSynchonizationPipeline
 gh-badge: [star, fork, follow]
 tags: [rust, raw_sync]
@@ -13,18 +13,64 @@ author: shiqifeng
 {: .box-success}
 A playback synchonizing design for mutiple videos on nvidia powered PCs.
 
-**Context: I will need to embed a `player` to unity to help decode 3+ videos and have them rendered and synchonized seamlessly against audios**
+**Context: I will need to embed a `player` to unity to help decode 3+ videos and have them rendered and synchonized seamlessly against audios, each video is just one portion of a big screen, so each frame rendered must align exactly**
 
-In this post, I woud like to discuss a player design that render multiple videos(mp4). I knew in some system such as Mac, there's `AVVideoComposition` API or something alike. But my intention is not to just 'render' it, but got some solution to share a surface to the actual player. So that the upper layer, a cross-platform player or application could just use the surface I produced to render. The video could be a 2k ~ 4k video with the framerate 30 ~ 60.
+In this post, I woud like to discuss a player design that render multiple videos(mp4). I knew in some system such as Mac, there's `AVVideoComposition` API or something alike. But my intention is not to just 'render' it, but got some cross-platform solution to share the surface to the actual renderer. So that the upper layer, a cross-platform player or application could just use the surface I produced. The video could be a 2k ~ 4k video with the framerate 30 ~ 60.
 
-### So, firstly, where to place the decoded frame
+### Firstly, how should we design the decoding workflow
 
-If we are to make sure all the videos are decoded smoothly, hw-accelerated decoding must be implemented, when rendering, we could use opengl or directx for displaying.
+If we are to make sure all the videos are decoded smoothly, hw-accelerated decoding must be implemented, that means the frame we got from decoder sits in gpu memory, when rendering, we could use opengl or directx for displaying, so the displaying container should sits in gpu as well. Decoding and Rendering are of 2 different phrase, and got many different formats(say cuda produce nv12, while opengl/directx need rgb). Normally, people shall copy the gpu data from decoded frame, to cpu ram, then back again to rendering phrase - opengl surface/ directx shader or flinger buffer, whatsoever, Just because they need to change the format, or use some cpu bound only tool such as opencv, etc.
 
-But here's the math, a 4k video with 60fps means 3840x2160x1.5x60=712MB/s of data transfering, if there's 5 videos transfering at the same time, the speed shall be 5x712 = 3.5GB/s. If we are to copy gpu data to ram then ram to surface, it means 3.5GB/s of data from gpu to cpu, then 3.5GB/s of data from cpu to gpu for surface rendering. That's rediculous, the player shall stucks with normal PCIe bus copying speed or surface uploading restrictions.
+```
+                    Video Playback Pipeline
+
+                ┌───────────────────────────┐
+Compressed ---->| HW Decoder                |
+H264/H265/AV1   | (NVDEC / VideoToolbox /   |
+                | DXVA / VAAPI / MediaCodec)|
+                └─────────────┬─────────────┘
+                              │
+                              │ Decoded Frame
+                              ▼
+                     GPU Memory (NV12/YUV420)
+
+                              │
+                              │ GPU → CPU Copy
+                              ▼
+                    +----------------------+
+                    |     System Memory    |
+                    |   NV12/YUV420 Frame  |
+                    +----------------------+
+                              │
+             ┌────────────────┴─────────────────┐
+             │                                  │
+             │ CPU Color Conversion             │
+             │ CPU Image Processing             │
+             │ OpenCV / FFmpeg Filters          │
+             │ AI Preprocessing                 │
+             └────────────────┬─────────────────┘
+                              │
+                              │ RGB/BGRA
+                              ▼
+                    +----------------------+
+                    |     System Memory    |
+                    |      RGB Frame       |
+                    +----------------------+
+                              │
+                              │ CPU → GPU Copy
+                              ▼
+                    GPU Texture / Surface
+                              │
+                              ▼
+                    OpenGL / DirectX / Metal
+                              │
+                              ▼
+                         Display Window
+```
+
+But here's the math, a 4k video with 60fps means 3840x2160x1.5x60=712MB/s of data transfering, if there's 5 videos transfering at the same time, the speed shall be 5x712 = 3.5GB/s. If we are to copy gpu data to ram then ram to surface, it means 3.5GB/s of data from gpu to cpu, then 3.5GB/s of data from cpu to gpu for surface rendering. This approach will be rediculous, when the player stucks with normal PCIe bus copying speed or surface uploading restrictions.
 
 ---
-
 **PCI Bus Copy Speeds**
 | PCIe Version | Per-Lane Data Rate | Encoding | **x1 Bandwidth** | **x4 Bandwidth** | **x8 Bandwidth** | **x16 Bandwidth** |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -40,176 +86,210 @@ But here's the math, a 4k video with 60fps means 3840x2160x1.5x60=712MB/s of dat
 **So I guess maybe the best way here is to copy decoded video data in gpu directly to surface**
 
 Something like:
-
 ```
-                Surface Pool
-        +-------------------------+
-        | Surface0                |
-        | Surface1                |
-        | Surface2                |
-        +-------------------------+
-
-              acquire()
-                  │
-                  ▼
-        +-----------------+
-        |   FREE Surface  |
-        +-----------------+
-                  │
-                  │ fill pixels
-                  ▼
-        +-----------------+
-        |     FILLED      |
-        +-----------------+
-                  │
-                  │ queue/present
-                  ▼
-        +-----------------+
-        |   RENDERING     |
-        +-----------------+
-                  │
-                  │ GPU/display finished
-                  ▼
-        +-----------------+
-        |    RELEASED     |
-        +-----------------+
-                  │
-                  │ recycle
-                  └──────────────────────────────┐
-                                                 │
-                                                 ▼
-                                           acquire again
+Bitstream
+    │
+    ▼
+NVDEC
+    │
+    ▼
+NV12 Frame (pitched)
+    │
+    │  (shared or mapped)
+    ▼
+CUDA / Fragment Shader
+    │
+    │  YUV→RGB, scaling, denoise,
+    │  crop, AI, tone mapping
+    ▼
+OpenGL Texture / Render Target
+    │
+    ▼
+Swapchain
+    │
+    ▼
+Display
 ```
 
-### Now that the data flow is designed, we now need a synchonizing pattern design. 
+This way, the image processing must be within gpu realm, therefore in the story of cuda, I need to introduce the Cuda [NPP](https://docs.nvidia.com/cuda/archive/9.1/npp/index.html) lib to transform image format and other processing works. This job must be done if we are to play with Unity3D, since the surface they provided is always RGBA format.
 
-To synchronize the frames, the surface we malloced must be in a `Grouped` format. Say, 5 videos, 5 surfaces in a group. They are registered together, filled together.
+NPP lib got no RGBA format, only RGB, but that's fine, let's do the converting with `nppiNV12ToRGB_8u_P2C3R_Ctx`, then pitching work with `cudaMemcpy2D`, inserting a 1 to every 4th item, as the alpha value.
 
+### Now that we have the surface data prepared, how should we fill the data into surface?. 
 
+Cuda provide some convenient api, called cuda interopping. With `cudaGraphicsGLRegisterImage` or `cudaGraphicsD3D11RegisterImage`, we could get register a opengl/d3d surface as a **Cuda Resource**, then `cudaGraphicsMapResources`+`cudaGraphicsSubResourceGetMappedArray` , we could get the resource buffer pointer/ptr array, which means the surface is ready to accept frame copying.
 
-PCI总线的拷贝速度，和我们常说的PCIe（PCI Express）是两回事。传统PCI总线理论上的最高速度是 **133 MB/s** 或 **533 MB/s**（64位/66MHz版本），而目前主流的PCIe总线速度要快得多，从几百MB/s到几十GB/s不等。
-
-我把两者的速度标准整理成了表格，方便你对比：
-
-### ⏳ 传统并行PCI总线速度
-
-传统的PCI总线是一种**并行总线**，它的速度主要由总线宽度和时钟频率决定。以下是常见的几种规格：
-
-| PCI 总线规格 | 总线宽度 | 时钟频率 | **理论带宽 (拷贝速度)** |
-| :--- | :--- | :--- | :--- |
-| **PCI 2.3** | 32-bit | 33 MHz | **133 MB/s** |
-| **PCI 2.3** | 32-bit | 66 MHz | **266 MB/s** |
-| **PCI 64** | 64-bit | 33 MHz | **266 MB/s** |
-| **PCI 64** | 64-bit | 66 MHz | **533 MB/s** |
-
-So maybe the best way is to get everything(including ffi) into rust program, just like libs(so/dylibs), but things turns out the algorithm model is composed of many python codes, they are associated in a way of depending each other and disk file searching/dynamic importing. This topology makes it impossible to rewrite them the c++/rust way. 
-
-### First Try
-So in our first attempt(version 1), we just did the work in a pipeline way, using stdin to stream all my yuv frames to python program, then stdout to pipe out. The pipeline is not cheap to get to work, since python code depend on many dependencies that secretly print something. I will need to design some header(separator) just like mp4 box or h26x annex-b way. to parse the real yuv content. 
-
-stdin
-```rust
-let mut idx = self.frames % infsdrs_len;
-let mut data = vec![];
-data.extend_from_slice(STDIO_SEP.as_bytes());
-data.extend_from_slice(&(self.frames as u32).to_be_bytes());
-self.prosess_avframe(self.dec_frame, &mut data)?;
+```
+OpenGL / D3D Texture (Render Surface)
+                 │
+                 │ Register
+                 │
+                 ▼
+      CUDA Graphics Resource
 ```
 
-stdout reading
-```rust
-let std_finder = memchr::memmem::Finder::new(&*STDIO_SEP);
-let sep_len = STDIO_SEP.len();
-loop {
-  if let Ok(n_rst) = tokio_read_stdio!(&mut stdout, &mut buf, 200) {
-      match n_rst {
-          Ok(n) => {
-              if n > 0 {
-                  cache.extend_from_slice(&buf[0..n]);
-                  if let Some(m) = std_finder.find(&cache) {
-                      if cache.len() >= total_frame_size + m {
-                      ...
+```
+Compressed Stream
+        │
+        ▼
+   HW Decoder
+        │
+        ▼
+  NV12 Decode Frame
+        │
+        │ Map Resource
+        ▼
+   CUDA Kernel
+ (NV12→RGB, Scale...)
+        │
+        ▼
+ Registered GL/D3D Surface
+        │
+        ▼
+   Render / Present
 ```
 
-And of course, some more pitch copying work for irregular-sized videos. 
+### Ok, now we get everything connected. But, just for one video scenario...
 
-The result is, yes, it works, at the cost of:
-1. Python needed, the program is not portable or not that easy to port, the whole system is just very 'dirty' 
-2. Pipeline memory is often huge, and there's few guarantee to prevent abnormal case such as clamping or breaker.
-3. Exception handling or the system design is complicated, we need to design a very robust patten to cover all abnormals.
+We could start multiple decoding thread, register multiple surface, then render them separately. Something like
 
-### Second Try
-Now that we got a dirty video enhanceing program up and running. We now want to evolve it. The evolving must cover the cons above. 
-
-1. Python issue. I tried many ways, initialy the miniforge, then uv tool. Luckily, it turns out the [pyinstaller](https://github.com/pyinstaller/pyinstaller) could build the algorithm model into executable, after some adjustment to turn the relative path to absolute path in the python codes. I made the executable functional. This is not ideal, but could save a lot of deployment complexity.
-
-2. Pipeline issue. To avoid large memory issue, I did consider semaphore before, but i will need these 2 terms
-    - it must be cross platform, so posix only way is not preferred
-    - algorithms will need more than 1 worker sometimes, so if i got 3 algo worker, at lease 3 semaphore must be created, this introduce sema management complexity
-As a result, I start to consider this crate [raw_sync](https://github.com/elast0ny/raw_sync-rs), to create a super fast, low memory cost shared memory mutex/rwlock flag.
-
-3. If I could fix the 2 issues above, that means the exception handling will shrink only to atomic flag, shm file processing and etc. Using a timeout and some flag design to report abnormal algorithm worker is much simplier than previous pure python + weight searching + pipeline design.
-
-This time, I turn to [shared memory](https://github.com/elast0ny/shared_memory-rs) and [raw_sync](https://github.com/elast0ny/raw_sync-rs). raw_sync already provides some mutex wrapping, on posix it is build upon pthread then on windows it uses winapi::um::synchapi. So a mutex is now created.
-
-So when i create a file using shared_memory, this shem crate shall map the file content into my ram, just like
 ```
-                                    Shared mmap() File
-     ┌────────────────────────────────────────────────────────────────────────────┐
-     │                                                                            │
-     │  +----------------+----------------------------------------------------+   │
-     │  | 0 ~ 7          | AtomicU8 Flag (8 bytes / cache-line aligned)       |   │
-     │  +----------------+----------------------------------------------------+   │
-     │  | 8 ~ xxx        | pthread_mutex_t (PTHREAD_PROCESS_SHARED)           |   │
-     │  +----------------+----------------------------------------------------+   │
-     │  | Input Buffer   |                                                    |   │
-     │  | (Rust → Python)|   Raw video frame / metadata                       |   │
-     │  |                |                                                    |   │
-     │  +----------------+----------------------------------------------------+   │
-     │  | Output Buffer  |                                                    |   │
-     │  | (Python→ Rust) |   Detection / AI result / processed frame          |   │
-     │  |                |                                                    |   │
-     │  +----------------+----------------------------------------------------+   │
-     │                                                                            │
-     └────────────────────────────────────────────────────────────────────────────┘
-              ▲                                                    ▲
-              │                                                    │
-              │                                                    │
-      write input frame                                   write AI result
-              │                                                    │
-              │                                                    │
-              │                                                    │
-  ┌──────────────────────────┐                        ┌──────────────────────────┐
-  │      Rust Process        │                        │   Pyo3/Python Process    │
-  │──────────────────────────│                        │──────────────────────────│
-  │ HW Decode                │                        │ AI / CV Algorithm        │
-  │ HW Video Processing      │                        │ NumPy / Torch / OpenCV   │
-  │ WebRTC / Encoder         │                        │ CPU/GPU Inference        │
-  └──────────────────────────┘                        └──────────────────────────┘
+                 One-time Initialization
+
++-----------+   +-----------+   +-----------+
+| GL Tex #1 |   | GL Tex #2 |   | GL Tex #3 |
++-----+-----+   +-----+-----+   +-----+-----+
+      |                 |                 |
+ Register          Register          Register
+      |                 |                 |
+      v                 v                 v
+ CUDA Resource1   CUDA Resource2   CUDA Resource3
+
+
+                 Per-frame (Independent)
+
+Video 1              Video 2              Video 3
+--------             --------             --------
+
+Bitstream1           Bitstream2           Bitstream3
+     |                    |                    |
+HW Decoder1          HW Decoder2          HW Decoder3
+     |                    |                    |
+NV12 Surface1        NV12 Surface2        NV12 Surface3
+     |                    |                    |
+Map Resource1        Map Resource2        Map Resource3
+     |                    |                    |
+CUDA Kernel1         CUDA Kernel2         CUDA Kernel3
+     |                    |                    |
+GL Texture1          GL Texture2          GL Texture3
+     |                    |                    |
+  Present1             Present2             Present3
 ```
 
-When the work is done, and I review what I did. The atomic and pthread looks like duplicate functions.
+Well, this design surely works. But we need to **synchonize** them. 
+A normal video player sychonizing got 3 pattern:
+1. video align to audio
+2. audio align to video
+3. both video/audio align to a unique timeline
 
-- AtomicU8 Flag is a shared memory based flag, to enable python end to use it, I build a python wheel project in rust and installed a python sdk to help deal with the flag. Both end could use this flag, looks seems to more to be a **Process Safe** pattern. The intesting part is, if I use the flag as the mutex lock, it takes about 10ns for each loop, more than a quick responding `spin lock`
+I picked up the 3rd option, since we got multiple video streams.Each video file got the same audio stream, so I pick up the first audio stream found from the video files, using a [cpal] (https://docs.rs/cpal/latest/cpal/) to play the sound, I will skip the audio details such as resampling thing since it is mainly about video works.
 
-```rust
-while flag.load(Ordering::Relaxed) != CODE_CONSUMED {
-    std::hint::spin_loop();
-    if write_start.elapsed().as_secs() > timeout {
-        bail!("Host timeout waiting for consumer flag CODE_CONSUMED")
-    }
-}
+Before synchonizing, the picture should looks like 
+
+```
+                 One-time Initialization
+
++-----------+   +-----------+   +-----------+
+| GL Tex #1 |   | GL Tex #2 |   | GL Tex #3 |
++-----+-----+   +-----+-----+   +-----+-----+
+      |                 |                 |
+ Register          Register          Register
+      |                 |                 |
+      v                 v                 v
+ CUDA Resource1   CUDA Resource2   CUDA Resource3
+
+
+                 Per-frame (Independent thread)
+
+Video 1             Video 2             Video 3             Audio
+--------            --------            --------            -----
+
+Bitstream1          Bitstream2          Bitstream3         Bitstream4
+     |                   |                   |                  |
+HW Decoder1         HW Decoder2         HW Decoder3        Audio Demux
+     |                   |                   |                  |
+NV12 Surface1       NV12 Surface2       NV12 Surface3      Audio Frames
+     |                   |                   |                  |
+Map Resource1       Map Resource2       Map Resource3        Decode
+     |                   |                   |                  |
+CUDA Kernel1        CUDA Kernel2        CUDA Kernel3       Audio Buffer
+     |                   |                   |                  |
+GL Texture1         GL Texture2         GL Texture3        CPAL Output
+     |                   |                   |                  |
+  Present1           Present2            Present3           Speakers
 ```
 
+Next, you’re probably considering timeline or time shift work. But you know, we need to synchonize the video at the frame level, so here's the thing, we need to `GROUP` all video frames first, then align video group with the audio pcm.
+The grouping is simply a data collecting work, all threads must provide a frame, if any thread is not fast enough, grouping thread should wait for it. But the waiting, should not block any of the decoding process, or there shall be stucking experiences. So we need to decouple the decoding and grouping work, when decoding thread produces frames, all frames must be sent to grouping thread and got cached. The grouping thread then, loops against some timeline pattern, picking up the right frame and got them copied to surface buffer.
 
-- If I use mutex to synchonize the buffer, sys-call shall be introduced. In posix, it is `pthread-mutex`, or maybe `futex`. Since it is kernel involing work, the user/kernel context swapping is some costing.
+So the design now should be something like this:
+```
+                         Independent Decode Threads
+================================================================================
 
-```rust
-let lock = self.lock
-  .try_lock(raw_sync::Timeout::Val(Duration::from_secs(timeout)))?;
+Video 1            Video 2            Video 3                 Audio
+--------           --------           --------                -----
+
+Bitstream1         Bitstream2         Bitstream3            Bitstream4
+     |                  |                  |                     |
+HW Decoder1        HW Decoder2        HW Decoder3           Audio Decode
+     |                  |                  |                     |
+Frame Cache1       Frame Cache2       Frame Cache3          PCM Buffer
+     |                  |                  |                     |
+     +------------------+------------------+---------------------+
+                        |                  |
+                        | decoded frames   |
+                        v                  |
+                +--------------------------------+
+                |         Frame Cache            |
+                |      (Ring Buffer Pool)        |
+                +--------------------------------+
+                        ▲                  |
+                        | recycled         | Load
+                        |                  |
+                        v                  v
+                 +-------------------------------+
+                 |        Grouping Thread        |
+                 |-------------------------------|
+                 | Wait until every cache has    |
+                 | a frame for current timeline  |
+                 | Align video frames with PCM   |
+                 | Select Frame Group            |
+                 +---------------+---------------+
+                                 |
+                  +--------------+--------------+
+                  |              |              |
+                  v              v              v
+               Video 1        Video 2        Video 3
+            Map Resource   Map Resource   Map Resource
+                  |              |              |
+            CUDA Kernel    CUDA Kernel    CUDA Kernel
+                  |              |              |
+             GL Texture     GL Texture     GL Texture
+                  |              |              |
+              Present1       Present2       Present3
+                                ||
+                                ||
+                        CPAL Audio Output
 ```
 
-It turns out the performance is no better than the atomicu8 flag, the only tradeoff for atomicu8 is, it takes up a CPU core when waiting.
+### finally, we could consider the timeline work.
+
+The grouping thread is in a forever looping, it keeps peeking the ring buffer pool, if any video/audio, put them to the corresponding video/audio cache. Each looping calculate the `current pts`(Presentation Timestamp) and the current latest video/audio pts, if video/audio `stream pts` is later than `current pts`, do the rendering.
+
+### Opengl restriction you dont want to miss.
+
+The opengl got a special rule, if thread A register a surface, the actual drawing must be in thread A. Therefore, the surface registering and the rendering must be exposeded to the upper layer(in our case, Unity3D).
 
 ## Summary
-If you got much more resource such as cpu cores and memory, the best performance is atomicu8 shared memory. If cpu cores is limited but memory is sufficient, you may consider pipeline(stdin/out). If you need solid solution, with limited memory, you may need to consider the futex way.
+We got a multiple video synchronizing player design and built based on opengl, which is os-independtent somehow, if on windows, we could use some d3d11 api, yes there's d3d11 cuda interloping as well.
