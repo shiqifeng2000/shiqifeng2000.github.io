@@ -238,9 +238,10 @@ GL Texture1         GL Texture2         GL Texture3        CPAL Output
 ```
 
 Next, you’re probably considering timeline or time shift work. But you know, we need to synchonize the video at the frame level, so here's the thing, we need to `GROUP` all video frames first, then align video group with the audio pcm.
-The grouping is simply a data collecting work, all threads must provide a frame, if any thread is not fast enough, grouping thread should wait for it. But the waiting, should not block any of the decoding process, or there shall be stucking experiences. So we need to decouple the decoding and grouping work, when decoding thread produces frames, all frames must be sent to grouping thread and got cached. The grouping thread then, loops against some timeline pattern, picking up the right frame and got them copied to surface buffer.
+The grouping is simply a data collecting work, all threads must provide a frame, if any thread is not fast enough, grouping thread should wait for it. 
+But the waiting, should not block any of the decoding process, or there shall be stucking experiences. So we need to decouple the decoding and grouping work, when decoding thread produces frames, all frames must be sent to grouping thread and got cached. The grouping thread then, loops against some timeline pattern, picking up the right frame and got them copied to surface buffer.
 
-So the design now should be something like this:
+The design now should be something like this:
 ```
                          Independent Decode Threads
 ================================================================================
@@ -256,16 +257,62 @@ Frame Cache1       Frame Cache2       Frame Cache3          PCM Buffer
      |                  |                  |                     |
      +------------------+------------------+---------------------+
                         |                  |
-                        | decoded frames   |
+                        | decoded frames   |  decoded pcm
+                        |                  |
+                        v                  v
+                 +-------------------------------+
+                 |        Grouping Thread        |
+                 |-------------------------------|
+                 | Wait until every cache has    |
+                 | a frame for current timeline  |
+                 | Align video frames with PCM   |
+                 | Select Frame Group            |
+                 +---------------+---------------+
+                                 |
+                  +--------------+--------------+
+                  |              |              |
+                  v              v              v
+               Video 1        Video 2        Video 3
+            Map Resource   Map Resource   Map Resource
+                  |              |              |
+            CUDA Kernel    CUDA Kernel    CUDA Kernel
+                  |              |              |
+             GL Texture     GL Texture     GL Texture
+                  |              |              |
+              Present1       Present2       Present3
+                                ||
+                                ||
+                        CPAL Audio Output
+```
+
+Since we are using NVDEC to decode the videos, the speed is ultra fast, if there's no blocking machenism, the gpu memory will soon be consumed and elipsed. So we need some ringbuffer design to harness the decoding thread, block if necessary, meanwhile keeps feeding gpu frame data to the grouping thread.
+We could use 2 [mpsc](https://doc.rust-lang.org/stable/std/sync/mpsc/index.html) channels, one to receive from decoding thread and get cached, with frame index(grouping), pts(video/audio synchonizing), stream hash(seeking) and necessary info included. Then send to the other side, the rendering side to unload the frame to surface, then get sent back again to decoding thread.
+
+Now the caching version:
+```
+                         Independent Decode Threads
+================================================================================
+
+Video 1            Video 2            Video 3                 Audio
+--------           --------           --------                -----
+
+Bitstream1         Bitstream2         Bitstream3            Bitstream4
+     |                  |                  |                     |
+HW Decoder1        HW Decoder2        HW Decoder3           Audio Decode
+     |                  |                  |                     |
+Frame Cache1       Frame Cache2       Frame Cache3          PCM Buffer
+     |                  |                  |                     |
+     +------------------+------------------+---------------------+
+                        |                  ▲
+                        | decoded frames   | recycled
                         v                  |
                 +--------------------------------+
                 |         Frame Cache            |
                 |      (Ring Buffer Pool)        |
                 +--------------------------------+
-                        ▲                  |
-                        | recycled         | Load
-                        |                  |
-                        v                  v
+                        |                  ▲
+                        | Load             | recycled
+                        v                  |
                  +-------------------------------+
                  |        Grouping Thread        |
                  |-------------------------------|
@@ -295,9 +342,13 @@ Frame Cache1       Frame Cache2       Frame Cache3          PCM Buffer
 
 The grouping thread is in a forever looping, it keeps peeking the ring buffer pool, if any video/audio, put them to the corresponding video/audio cache. Each looping calculate the `current pts`(Presentation Timestamp) and the current latest video/audio pts, if video/audio `stream pts` is later than `current pts`, do the rendering.
 
+### Cuda pipeline cons you dont want to miss.
+
+The CUDA API works in a pipelined, async‑fashion. When you call `cudaMemcpy`, it doesn't actually block — it just queues up the work and returns immediately. That's great for performance, but it can bite you when synchronizing frames. If you copy multiple frames to surfaces in quick succession, you might end up with mismatched indices because the actual copying order doesn't strictly follow your calls. To fix this, you need to explicitly insert a sync point, like `cudaStreamSynchronize`, to ensure everything's done before moving on.
+
 ### Opengl restriction you dont want to miss.
 
-The opengl got a special rule, if thread A register a surface, the actual drawing must be in thread A. Therefore, the surface registering and the rendering must be exposeded to the upper layer(in our case, Unity3D).
+OpenGL has a well‑known restriction: the thread that registers a GL resource (like a texture) must be the same one that renders into it. You can't offload rendering to another thread. So in our design, both registration and rendering have to live in the layer that owns the GL context — in our case, that's Unity3D.
 
 ## Summary
 We got a multiple video synchronizing player design and built based on opengl, which is os-independtent somehow, if on windows, we could use some d3d11 api, yes there's d3d11 cuda interloping as well.
