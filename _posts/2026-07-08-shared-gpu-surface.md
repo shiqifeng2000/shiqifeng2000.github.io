@@ -18,7 +18,7 @@ A playback synchonizing design for mutiple videos on nvidia powered PCs.
 **Context: I need to embed a player into Unity to decode 3+ videos, render them, and synchronize them seamlessly with audio. Each video represents one portion of a larger screen, so every rendered frame must align exactly.**
 
 
-In this post, I'd like to discuss a player design that renders multiple MP4 videos. I know that some systems, such as macOS, provide APIs like `AVVideoComposition`. However, my goal isn't just to "render" video — I need a cross-platform solution that can share the decoded surface with the actual renderer, so that an upper-layer cross-platform player or application can consume the surface I produce. The videos are 2K to 4K, running at 30 to 60 fps.
+In this post, I'd like to discuss a player design that renders multiple MP4 videos. I know that some systems, such as macOS, provide APIs like `AVVideoComposition`. However, my goal isn't just to "render" video — I need a cross-platform solution that can share the decoded surface with the actual renderer, so that an upper-layer cross-platform player or application manipulate the surface I share. The videos are 2K to 4K, running at 30 to 60 fps.
 
 ### First, how should we design the decoding workflow?
 
@@ -351,4 +351,4 @@ The CUDA API works in a pipelined, async‑fashion. When you call `cudaMemcpy`, 
 OpenGL has a well‑known restriction: the thread that registers a GL resource (like a texture) must be the same one that renders into it. You can't offload rendering to another thread. So in our design, both registration and rendering have to live in the layer that owns the GL context — in our case, that's Unity3D.
 
 ## Summary
-We got a multiple video synchronizing player design and built based on opengl, which is os-independtent somehow, if on windows, we could use some d3d11 api, yes there's d3d11 cuda interloping as well.
+We got a multiple video synchronizing player design and built based on opengl, which is os-independtent somehow, if on windows, we could use some d3d11 api, yes there's d3d11 cuda interloping api as well.
