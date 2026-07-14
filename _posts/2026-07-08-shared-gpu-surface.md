@@ -4,7 +4,7 @@ title: How to design a multiple video rendering lib with synchonizing feature.
 subtitle: A cuda based gpu interlop case with synchonization.
 gh-repo: shiqifeng2000/VideoSynchonizationPipeline
 gh-badge: [star, fork, follow]
-tags: [rust, raw_sync]
+tags: [rust, cuda, opengl, d3d11]
 comments: true
 mathjax: true
 author: shiqifeng
